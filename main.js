@@ -2,9 +2,31 @@ const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain } = require("ele
 const path = require("path");
 const fs = require("fs");
 
-// OpenAI settings (uses Node 18+ fetch / FormData / Blob)
+// Provider settings (uses Node 18+ fetch / FormData / Blob)
+// ENV configuration:
+//   STT_PROVIDER=openai|gemini           (default: openai)
+//   LLM_PROVIDER=openai|gemini           (default: openai)
+//   OPENAI_API_KEY=...                   (required for OpenAI calls)
+//   OPENAI_BASE_URL=...                  (optional)
+//   OPENAI_STT_MODEL=gpt-4o-mini-transcribe | gpt-4o-transcribe
+//   OPENAI_FORMAT_MODEL=gpt-4o-mini | gpt-4o | ...
+//   GEMINI_API_KEY=... or GOOGLE_API_KEY (required for Gemini calls)
+//   GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+//   GEMINI_STT_MODEL=models/gemini-2.5-flash
+//   GEMINI_LLM_MODEL=models/gemini-2.5-flash | models/gemini-2.5-pro
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+const OPENAI_STT_MODEL = process.env.OPENAI_STT_MODEL || "gpt-4o-mini-transcribe"; // default STT
+const OPENAI_FORMAT_MODEL = process.env.OPENAI_FORMAT_MODEL || "gpt-4o-mini"; // default LLM
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+const GEMINI_BASE_URL = process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta";
+const GEMINI_STT_MODEL = process.env.GEMINI_STT_MODEL || "models/gemini-2.5-flash"; // accepts audio inputs
+const GEMINI_LLM_MODEL = process.env.GEMINI_LLM_MODEL || "models/gemini-2.5-flash";
+
+// Provider selection (default to openai)
+const STT_PROVIDER = (process.env.STT_PROVIDER || "openai").toLowerCase(); // openai | gemini
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || "openai").toLowerCase(); // openai | gemini
 
 let win, tray;
 app.whenReady().then(() => {
@@ -121,10 +143,15 @@ ipcMain.handle("recording:stop", async () => {
     currentFilePath = null;
 
     // If API key is set, run STT + LLM formatting
-    if (OPENAI_API_KEY && finalizedPath) {
+    if (finalizedPath) {
       try {
-        const transcription = await transcribeWithOpenAI(finalizedPath, currentMimeType || "audio/webm");
-        const formatted = await formatWithLLM(transcription);
+        const transcription = STT_PROVIDER === "gemini"
+          ? await transcribeWithGemini(finalizedPath, currentMimeType || "audio/webm")
+          : await transcribeWithOpenAI(finalizedPath, currentMimeType || "audio/webm");
+
+        const formatted = LLM_PROVIDER === "gemini"
+          ? await formatWithGemini(transcription)
+          : await formatWithOpenAI(transcription);
         if (win && !win.isDestroyed()) {
           win.webContents.send("recording:result", { filePath: finalizedPath, text: formatted, raw: transcription });
         }
@@ -134,8 +161,8 @@ ipcMain.handle("recording:stop", async () => {
           win.webContents.send("recording:result", { filePath: finalizedPath, error: String(err) });
         }
       }
-    } else if (win && !win.isDestroyed() && finalizedPath) {
-      win.webContents.send("recording:result", { filePath: finalizedPath, info: "OPENAI_API_KEY not set. Skipped transcription." });
+    } else if (win && !win.isDestroyed()) {
+      win.webContents.send("recording:result", { filePath: finalizedPath, info: "No file to transcribe." });
     }
 
     return { ok: true, filePath: finalizedPath };
@@ -150,7 +177,7 @@ async function transcribeWithOpenAI(filePath, mimeType) {
   const blob = new Blob([buffer], { type: mimeType || "audio/webm" });
   const form = new FormData();
   form.append("file", blob, filePath.split(path.sep).pop());
-  form.append("model", "whisper-1");
+  form.append("model", OPENAI_STT_MODEL);
   // You can set language hints if needed: form.append("language", "ja");
 
   const res = await fetch(`${OPENAI_BASE_URL}/audio/transcriptions`, {
@@ -168,7 +195,7 @@ async function transcribeWithOpenAI(filePath, mimeType) {
   return data.text || "";
 }
 
-async function formatWithLLM(transcribedText) {
+async function formatWithOpenAI(transcribedText) {
   const system = "あなたは有能な秘書です。ユーザーの口語の発話を書き言葉に整え、箇条書きや段落で読みやすく要点化します。不要なフィラー（えー、あのー等）は除去し、事実を変えない範囲で語尾と文法を整えます。日本語で出力してください。";
   const user = `元の文字起こし:\n${transcribedText}\n\n出力条件:\n- 誤認識は文脈で軽微に補正\n- 箇条書きが適切なら使う\n- 重要タスクはTODOとして明示`;
 
@@ -179,7 +206,7 @@ async function formatWithLLM(transcribedText) {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: process.env.OPENAI_FORMAT_MODEL || "gpt-4o-mini",
+      model: OPENAI_FORMAT_MODEL,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -193,4 +220,64 @@ async function formatWithLLM(transcribedText) {
   }
   const data = await res.json();
   return data.choices?.[0]?.message?.content?.trim() || transcribedText;
+}
+
+async function transcribeWithGemini(filePath, mimeType) {
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set");
+  const buffer = fs.readFileSync(filePath);
+  // Gemini 2.5 Flash: multimodal content API (JSON)
+  const base64 = buffer.toString("base64");
+  const url = `${GEMINI_BASE_URL}/${GEMINI_STT_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { text: "次の音声を日本語で文字起こししてください。句読点を適切に付与してください。" },
+          {
+            inline_data: {
+              mime_type: mimeType || "audio/webm",
+              data: base64,
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini STT error ${res.status}: ${errText}`);
+  }
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.map(p => p.text).join("")?.trim();
+  return text || "";
+}
+
+async function formatWithGemini(transcribedText) {
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set");
+  const url = `${GEMINI_BASE_URL}/${GEMINI_LLM_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+  const system = "あなたは有能な秘書です。口語の発話を日本語の書き言葉に整え、要点を箇条書きや段落で整理します。フィラーは除去し、事実を変えない範囲で文法と語尾を整えます。";
+  const user = `元の文字起こし:\n${transcribedText}\n\n出力条件:\n- 誤認識は文脈で軽微に補正\n- 箇条書きが適切なら使う\n- 重要タスクはTODOとして明示`;
+  const body = {
+    contents: [
+      { role: "user", parts: [{ text: system + "\n\n" + user }] },
+    ],
+  };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini LLM error ${res.status}: ${errText}`);
+  }
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.map(p => p.text).join("")?.trim();
+  return text || transcribedText;
 }
