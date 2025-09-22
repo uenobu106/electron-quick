@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain } = require("electron");
+const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, nativeImage } = require("electron");
 const path = require("path");
 const fs = require("fs");
 
@@ -30,6 +30,14 @@ const LLM_PROVIDER = (process.env.LLM_PROVIDER || "openai").toLowerCase(); // op
 
 let win, tray;
 app.whenReady().then(() => {
+  // Resolve app icon path for Windows to avoid relative path issues and mojibake in console
+  const resolveAssetPath = (...paths) => {
+    return app.isPackaged
+      ? path.join(process.resourcesPath, ...paths)
+      : path.join(__dirname, ...paths);
+  };
+  const windowsIconPath = process.platform === "win32" ? resolveAssetPath("icon.ico") : undefined;
+
   win = new BrowserWindow({
     width: 400,
     height: 200,
@@ -46,36 +54,35 @@ app.whenReady().then(() => {
       webSecurity: false,
       allowRunningInsecureContent: true,
     },
+    icon: windowsIconPath,
   });
-  // デバッグ用
-  console.log("ウィンドウが作成されました");
+  // Debug logs (ASCII only to avoid mojibake on non-UTF8 consoles)
+  console.log("Window created");
 
   win.loadFile(path.join(__dirname, "index.html"));
 
-  console.log("URLを読み込みました");
+  console.log("Loaded index.html");
 
-  // エラーハンドリング
+  // Error handling (ASCII-only console messages)
   win.webContents.on("did-fail-load", (event, errorCode, errorDescription) => {
-    console.error(
-      "ページの読み込みに失敗しました:",
-      errorCode,
-      errorDescription
-    );
+    console.error("Failed to load page:", errorCode, String(errorDescription || ""));
   });
 
   win.webContents.on("did-finish-load", () => {
-    console.log("ページの読み込みが完了しました");
+    console.log("Page load finished");
   });
 
-  // macOSの場合はデフォルトのアイコンを使用、Windowsの場合はicon.icoファイルを使用
-  const iconPath = process.platform === "darwin" ? undefined : "./icon.ico";
-  if (iconPath) {
-    tray = new Tray(iconPath);
+  // Tray icon: use resolved absolute path on Windows, empty icon on macOS if not provided
+  if (process.platform === "win32") {
+    const trayIconPath = windowsIconPath;
+    if (fs.existsSync(trayIconPath)) {
+      tray = new Tray(trayIconPath);
+    } else {
+      console.warn("Tray icon not found:", trayIconPath);
+      tray = new Tray(nativeImage.createEmpty());
+    }
   } else {
-    // macOSの場合は空のNativeImageを作成
-    const { nativeImage } = require("electron");
-    const emptyIcon = nativeImage.createEmpty();
-    tray = new Tray(emptyIcon);
+    tray = new Tray(nativeImage.createEmpty());
   }
   tray.setContextMenu(
     Menu.buildFromTemplate([
@@ -91,6 +98,22 @@ app.whenReady().then(() => {
   globalShortcut.register("Control+Space", () => {
     win.webContents.send("toggle-record");
   });
+});
+
+// Global process-level error handlers: keep console output ASCII-only
+process.on("uncaughtException", (error) => {
+  try {
+    console.error("uncaughtException:", String(error && error.message ? error.message : error));
+  } catch {
+    console.error("uncaughtException: <non-string error>");
+  }
+});
+process.on("unhandledRejection", (reason) => {
+  try {
+    console.error("unhandledRejection:", String(reason && reason.message ? reason.message : reason));
+  } catch {
+    console.error("unhandledRejection: <non-string reason>");
+  }
 });
 
 // Recording IPC: receive chunks from renderer and write to file
