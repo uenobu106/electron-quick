@@ -129,6 +129,45 @@
         box-shadow: 0 32px 64px rgba(255, 71, 87, 0.2),
           inset 0 1px 0 rgba(255, 255, 255, 0.1);
       }
+
+      .result-panel {
+        position: absolute;
+        bottom: 24px;
+        left: 24px;
+        right: 24px;
+        max-height: 40vh;
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        overflow: auto;
+      }
+
+      .result-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 8px;
+        font-weight: 600;
+        opacity: 0.9;
+      }
+
+      .result-actions button {
+        appearance: none;
+        border: 0;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.15);
+        color: #fff;
+        cursor: pointer;
+      }
+
+      .result-text {
+        white-space: pre-wrap;
+        line-height: 1.6;
+        font-size: 14px;
+        opacity: 0.95;
+      }
     </style>
   </head>
   <body>
@@ -143,14 +182,36 @@
       />
     </div>
 
+    <div class="result-panel" id="resultPanel" style="display: none;">
+      <div class="result-header">
+        <span id="resultTitle">結果</span>
+        <div class="result-actions">
+          <button id="copyBtn">コピー</button>
+        </div>
+      </div>
+      <div class="result-text" id="resultText"></div>
+    </div>
+
     <script>
       const characterImage = document.getElementById("characterImage");
       const characterContainer = document.getElementById("characterContainer");
       const recordingIndicator = document.getElementById("recordingIndicator");
+      const resultPanel = document.getElementById("resultPanel");
+      const resultTextEl = document.getElementById("resultText");
+      const resultTitleEl = document.getElementById("resultTitle");
+      const copyBtn = document.getElementById("copyBtn");
 
       let currentImageIndex = 0;
       let isRecording = false;
       const images = ["girl.png", "girl2.png"];
+
+      // MediaRecorder state
+      let mediaStream = null;
+      let mediaRecorder = null;
+      let ipcRenderer = null;
+      if (typeof require !== "undefined") {
+        ({ ipcRenderer } = require("electron"));
+      }
 
       // シングルクリックで画像切り替えと録音切り替え
       characterImage.addEventListener("click", () => {
@@ -171,26 +232,94 @@
       });
 
       // Electronのメインプロセスからのメッセージを受信
-      if (typeof require !== "undefined") {
-        const { ipcRenderer } = require("electron");
+      if (ipcRenderer) {
         ipcRenderer.on("toggle-record", () => {
           toggleRecording();
         });
+        ipcRenderer.on("recording:result", (_e, payload) => {
+          const { text, raw, error, info, filePath } = payload || {};
+          let display = "";
+          if (error) {
+            display = `エラー: ${error}`;
+          } else if (text) {
+            display = text;
+          } else if (raw) {
+            display = raw;
+          } else if (info) {
+            display = info;
+          } else {
+            display = "結果がありません";
+          }
+          resultTitleEl.textContent = filePath ? `結果 (${filePath})` : "結果";
+          resultTextEl.textContent = display;
+          resultPanel.style.display = "block";
+        });
       }
 
-      function toggleRecording() {
+      copyBtn?.addEventListener("click", async () => {
+        const text = resultTextEl.textContent || "";
+        try {
+          await navigator.clipboard.writeText(text);
+          copyBtn.textContent = "コピー済み";
+          setTimeout(() => (copyBtn.textContent = "コピー"), 1200);
+        } catch (_) {}
+      });
+
+      async function ensureStream() {
+        if (mediaStream) return;
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (err) {
+          alert("マイクへのアクセスに失敗しました: " + err);
+          throw err;
+        }
+      }
+
+      async function startRecording() {
+        await ensureStream();
+        const mimeType = "audio/webm;codecs=opus";
+        if (!window.MediaRecorder || !MediaRecorder.isTypeSupported?.(mimeType)) {
+          alert("この環境では録音がサポートされていません");
+          return;
+        }
+
+        mediaRecorder = new MediaRecorder(mediaStream, { mimeType });
+
+        if (ipcRenderer) await ipcRenderer.invoke("recording:start", { mimeType });
+
+        mediaRecorder.addEventListener("dataavailable", async (e) => {
+          if (!e.data || e.data.size === 0) return;
+          const arrayBuffer = await e.data.arrayBuffer();
+          const nodeBuffer = Buffer.from(arrayBuffer);
+          ipcRenderer?.send("recording:data", nodeBuffer);
+        });
+        mediaRecorder.addEventListener("stop", () => {
+          ipcRenderer?.invoke("recording:stop");
+        });
+
+        mediaRecorder.start(250);
+      }
+
+      function stopRecording() {
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+        }
+      }
+
+      async function toggleRecording() {
         isRecording = !isRecording;
 
         if (isRecording) {
-          // 録音開始
           characterImage.classList.add("recording");
           characterContainer.classList.add("recording");
           recordingIndicator.classList.add("active");
+          resultPanel.style.display = "none";
+          await startRecording();
         } else {
-          // 録音停止
           characterImage.classList.remove("recording");
           characterContainer.classList.remove("recording");
           recordingIndicator.classList.remove("active");
+          stopRecording();
         }
       }
     </script>
